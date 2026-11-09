@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 桌面图标下显示的名字 -->
+    <string name="app_name">小说阅读器 Lite</string>
+</resources>
