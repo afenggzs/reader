@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SHELL = os.path.join(os.path.dirname(HERE), 'native_shell')
 
 # 发版时只改这一行。构建号（时间戳/分钟数）由下面自动生成。
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.1.1'
 
 
 def build_stamp(now=None):

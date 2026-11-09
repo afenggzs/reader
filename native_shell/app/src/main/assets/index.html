@@ -672,7 +672,7 @@
               <div class="sub-sec" data-sec="bright">
                 <div class="bright-row">
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg>
-                  <input type="range" id="bright" min="0" max="60" value="0">
+                  <input type="range" id="bright" min="0" max="60" value="60">
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
                 </div>
               </div>
@@ -830,6 +830,9 @@
   const LS_PROG = "reader.progress.v1";
   const LS_IMP  = "reader.imported.v1";
   const LS_SET  = "reader.settings.v1";
+  // 设置结构版本：v2 起字号默认 19；v3 起「亮度」的含义从「遮罩深浅」翻成「亮度」（60=最亮）。
+  // 读老数据时按版本做一次性换算，用户存过的值不会被重置。
+  const SET_V   = 3;
   // 目录缓存的键带解析引擎版本号：切章规则升级（如支持行首缩进的「第X节」）后，
   // 旧版缓存的分章结果会失效自动重切，避免用户继续看到「几章混成一章」的旧目录。
   const LS_TOC  = "reader.toc.v2";      // 每本导入书的固定目录 [{title,start,end}]，首开后不再重复全文切分
@@ -874,8 +877,12 @@
       if(s.theme) curTheme = s.theme;
       // 默认字号 2026-11-07 从 18 提到 19。老版本本地存着「旧默认 18」的人，升级后要看到 19；
       // 但自己调过字号的人（存的是 16/22…）不能被覆盖 —— 用设置版本号做一次性迁移，v>=2 之后完全听用户的。
-      if(typeof s.font === "number") fontPx = (s.v === 2 || s.font !== 18) ? s.font : 19;
-      if(typeof s.bright === "number") brightVal = s.bright;
+      if(typeof s.font === "number") fontPx = ((s.v|0) >= 2 || s.font !== 18) ? s.font : 19;
+      if(typeof s.bright === "number"){
+        // v<3 存的是「遮罩深浅」（0=最亮），换算成「亮度」；v>=3 存的就是亮度本身
+        brightVal = ((s.v|0) >= 3) ? s.bright : (BRIGHT_MAX - s.bright);
+        brightVal = Math.min(BRIGHT_MAX, Math.max(0, brightVal));
+      }
     }catch(e){}
   }
   // IndexedDB 兜底存储：正文 text 可能很大（几十 MB），localStorage 5MB 配额装不下会导致导入书丢失。
@@ -933,7 +940,7 @@
       localStorage.setItem(LS_PROG, JSON.stringify(progressStore));
       // 正文 text 较大，仅存元数据，正文走 IndexedDB（绝不塞进 localStorage，避免超配额）
       localStorage.setItem(LS_IMP, JSON.stringify(importedBooks.map(b=>({id:b.id, name:b.name, color:b.color, hasText:!!b.text}))));
-      localStorage.setItem(LS_SET, JSON.stringify({v:2, theme:curTheme, font:fontPx, bright:brightVal}));
+      localStorage.setItem(LS_SET, JSON.stringify({v:SET_V, theme:curTheme, font:fontPx, bright:brightVal}));
       localStorage.setItem(LS_TOC, JSON.stringify(tocStore));
       localStorage.setItem(LS_LAST, JSON.stringify(lastReadStore));
       localStorage.setItem(LS_DEL, JSON.stringify([...deletedBuiltin]));
@@ -1019,11 +1026,26 @@ function sliceBody(raw, start, end){
   }
   return body;
 }
+// 全文只收一次：主线程发 {type:"text", raw} 之后，后续 slice 只传行号区间。
+// 早先每章都把 raw 一起发过来，结构化克隆要按整本书的体积走一遍、再全文 split 一次，
+// 书越大越慢 —— 这是「读了几十章之后，跨章翻页会卡一下」的主因。
+var __lines = null;
 self.onmessage = function(e){
   var d = e.data || {};
   try{
-    if(d.type === "toc"){ self.postMessage({ ok:true, toc: tocParse(d.raw) }); }
-    else if(d.type === "slice"){ self.postMessage({ ok:true, body: sliceBody(d.raw, d.start, d.end) }); }
+    if(d.type === "text"){ __lines = normLines(d.raw || ""); self.postMessage({ ok:true, lines:__lines.length }); }
+    else if(d.type === "toc"){ self.postMessage({ ok:true, toc: tocParse(d.raw) }); }
+    else if(d.type === "slice"){
+      if(typeof d.raw === "string"){
+        self.postMessage({ ok:true, body: sliceBody(d.raw, d.start, d.end) });
+      } else if(__lines){
+        var body = [];
+        for(var i=d.start;i<d.end && i<__lines.length;i++){ if(__lines[i].length>0) body.push(__lines[i]); }
+        self.postMessage({ ok:true, body: body });
+      } else {
+        self.postMessage({ ok:false, error:"no-text" });   // 主线程会退回同步切片
+      }
+    }
     else { self.postMessage({ ok:false, error:"unknown-type" }); }
   }catch(err){
     // 解析异常也回发结果，确保主线程 Promise 能正确结束（而非永久 pending）
@@ -1063,8 +1085,11 @@ self.onmessage = function(e){
 
   // 通用 Worker 调用封装（带超时：Worker 卡死或异常不发回时，超时兜底降级到主线程同步解析，避免「正在解析」永久挂起）
   const WORKER_TIMEOUT = 15000;   // 15s 超时
+  // Worker 只有一个消息口：并发发两个请求会串台（A 的结果被 B 的监听器先收到）。
+  // 预载和用户翻页现在会同时发请求，所以必须排队，一次只跑一个。
+  let workerQueue = Promise.resolve();
   function workerCall(payload){
-    return new Promise((resolve, reject)=>{
+    const run = () => new Promise((resolve, reject)=>{
       if(!parseWorker){ reject(new Error("no-worker")); return; }
       let done = false;
       let timer = setTimeout(()=>{ if(done) return; done = true; cleanup(); reject(new Error("timeout")); }, WORKER_TIMEOUT);
@@ -1075,6 +1100,9 @@ self.onmessage = function(e){
       parseWorker.addEventListener("error", onErr);
       try { parseWorker.postMessage(payload); } catch(err){ onErr(err); }
     });
+    const p = workerQueue.then(run, run);
+    workerQueue = p.then(()=>{}, ()=>{});   // 一次失败不能堵住后面的请求
+    return p;
   }
 
   // 异步仅切目录（返回 [{title,start,end}]）
@@ -1083,11 +1111,28 @@ self.onmessage = function(e){
       .then(r => (r && r.toc) ? r.toc : parseTocSync(raw))
       .catch(() => parseTocSync(raw));
   }
-  // 异步按行号切片某章正文
-  function sliceBodyAsync(raw, start, end){
-    return workerCall({ type:"slice", raw, start, end })
-      .then(r => (r && r.body) ? r.body : sliceBodySync(raw, start, end))
-      .catch(() => sliceBodySync(raw, start, end));
+  // 异步按行号切片某章正文。Worker 里只缓存一份全文：第一次发 text，之后只传区间，
+  // 换书（book.id 变了）才重发。Worker 不可用/超时则退回主线程同步切片。
+  let workerTextBook = null;
+  function workerSetText(book){
+    if(!parseWorker) return Promise.resolve(false);
+    if(workerTextBook === book.id) return Promise.resolve(true);
+    return workerCall({ type:"text", raw: book.text })
+      .then(()=>{ workerTextBook = book.id; return true; })
+      .catch(()=>false);
+  }
+  async function sliceBodyAsync(book, start, end){
+    const raw = book && book.text;
+    if(!raw) return [];
+    let ok = false;
+    try { ok = await workerSetText(book); } catch(e){}
+    if(ok){
+      try{
+        const r = await workerCall({ type:"slice", start, end });
+        if(r && r.body) return r.body;
+      }catch(e){}
+    }
+    return sliceBodySync(raw, start, end);
   }
 
   // 读取本地文本文件，自动判别 UTF-8 / GBK 编码（中文 txt 常见 GBK）
@@ -2119,7 +2164,8 @@ self.onmessage = function(e){
   let allTotal = 0;     // 整书总页数（用于右下角整书进度%）
   let animating = false;
   let fontPx = 19;
-  let brightVal = 0;        // 亮度遮罩透明度（0~0.6），持久化用
+  const BRIGHT_MAX = 60;    // 亮度上限（最亮）；遮罩不透明度 = (BRIGHT_MAX - 亮度)/100，最暗时 0.6
+  let brightVal = BRIGHT_MAX;   // 亮度 0~60，60 = 不遮罩。滑条左＝暗、右＝亮，和两侧太阳图标一致
   let curBookName = "暗流";   // 当前阅读的书名，用于章首页左上角小标题
   let gBodyH = 0, gBodyHFirst = 0;   // 分页实测的正文可用高度，渲染时锁定，保证测量=显示
 
@@ -2466,6 +2512,7 @@ self.onmessage = function(e){
     clearTopEdge();   // 复位时去掉翻页残留的右缘阴影
     markToc(curChapter);
     pgSync();         // 同步底部进度线
+    schedulePreload();  // 停稳后把后面几章提前切好，避免翻到章末才现切
   }
 
   // 把全书每章独立分页（保留分章结构，页码按章计数，不动原逻辑）
@@ -2487,6 +2534,28 @@ self.onmessage = function(e){
       return (prev && prev[i] && prev[i].length) ? prev[i] : [""];
     });
     allTotal = bookPages.reduce((a,ps)=>a + (ps ? ps.length : 0), 0);
+  }
+
+  // 增量分页：只补「已有正文但还没分页」的章。
+  // 跨章翻页走这条 —— 早先用的是 paginateLoadedChapters，它会把**所有**已加载章重排一遍，
+  // 而正文一旦载入就不会释放，于是读得越久、已读章越多，跨章翻页那一下就越慢
+  // （读到三十几章时一次要重排三十多章，肉眼可见卡一下）。现在代价只和「新载入的章数」有关。
+  function paginateMissing(){
+    if(!stage.clientWidth || !stage.clientHeight) return 0;   // 舞台不可见时量出来是错的，宁可不排
+    if(bookPages.length !== chapters.length) bookPages.length = chapters.length;   // 换书/换骨架后对齐长度
+    let added = 0;
+    for(let i = 0; i < chapters.length; i++){
+      const c = chapters[i];
+      if(!c || !c.body || !c.body.length) continue;
+      const ps = bookPages[i];
+      // 空占位页（[""]）是「正文还没载入」时留下的，不能当成已分页
+      const done = ps && ps.length && !(ps.length === 1 && ps[0] === "");
+      if(done) continue;
+      bookPages[i] = paginate(c.body.join("\n"), c.title);
+      added++;
+    }
+    if(added) allTotal = bookPages.reduce((a,ps)=>a + (ps ? ps.length : 0), 0);
+    return added;
   }
 
   // 跳到某章首页（目录点击用），无翻页动画直接定位
@@ -2607,6 +2676,7 @@ self.onmessage = function(e){
       pgSync();            // 顺带同步菜单里的整书进度条
       animating = false;
       saveProgress();
+      schedulePreload();   // 落位后接着预载下一章
     }, 330);
   }
 
@@ -2968,24 +3038,31 @@ self.onmessage = function(e){
     return arr;
   }
 
-  // 惰性载入某章正文（幂等：已加载则跳过）
+  // 惰性载入某章正文（幂等：已加载则跳过；并发调用共用同一个 Promise，不会切两遍）
+  const chapterLoading = new Map();   // `${bookId}|${ci}` → Promise
   async function ensureChapterBody(book, ci){
     const chs = book.chapters;
     if(!chs || !chs[ci]) return;
     if(chs[ci].body && chs[ci].body.length) return;   // 已加载
-    const toc = book.toc;
-    let body;
-    if(toc && toc[ci]){
-      const s = toc[ci];
-      body = await sliceBodyAsync(book.text, s.start, s.end);
-    } else {
-      // 目录缺失/异常时的兜底：整章取全文（保证内容绝不因 toc 缺失而丢失）
-      body = await sliceBodyAsync(book.text, 0, Number.MAX_SAFE_INTEGER);
-    }
-    chs[ci].body = body.length ? body : [""];
+    const key = book.id + "|" + ci;
+    if(chapterLoading.has(key)){ await chapterLoading.get(key); return; }
+    const job = (async ()=>{
+      const toc = book.toc;
+      let body;
+      if(toc && toc[ci]){
+        const s = toc[ci];
+        body = await sliceBodyAsync(book, s.start, s.end);
+      } else {
+        // 目录缺失/异常时的兜底：整章取全文（保证内容绝不因 toc 缺失而丢失）
+        body = await sliceBodyAsync(book, 0, Number.MAX_SAFE_INTEGER);
+      }
+      chs[ci].body = body.length ? body : [""];
+    })();
+    chapterLoading.set(key, job);
+    try { await job; } finally { chapterLoading.delete(key); }
   }
 
-  // 预载「当前章 ± 窗口」的正文，随后分页
+  // 载入「当前章 ± 窗口」的正文，随后只补这些新章的分页
   async function loadWindowAndPaginate(book, ci){
     const chs = book.chapters;
     for(let k = ci - LAZY_WINDOW; k <= ci + LAZY_WINDOW; k++){
@@ -2993,8 +3070,52 @@ self.onmessage = function(e){
     }
     // 等待一帧，确保阅读舞台已布局（stage.clientWidth/Height 有效），否则分页会退回整章一页
     await new Promise(r=>requestAnimationFrame(()=>r()));
-    // 大书：只重分页「已加载正文」的章，未加载章保持占位，避免对上千章全量逐字二分卡死主线程
-    paginateLoadedChapters();
+    // 只补新载入的章（不是全书、也不是所有已读章），代价恒定
+    paginateMissing();
+  }
+
+  // ---------- 预载：把下一章提前切好并分页，翻到章末时零等待 ----------
+  // 动机：正文是按章懒切的，翻到「本章最后一页再往后」时才去切下一章，
+  // 那一下必然要等（切行 + 分页），读得越久越明显。现在在空闲时先把后面几章备好。
+  const PRELOAD_AHEAD = 2;      // 往后预载几章；1 章就够用，2 章是为了跨章后还能再翻
+  const PRELOAD_DELAY = 220;    // 停下来多久才开始预载（连续翻页时只跑最后一次）
+  let preloadGen = 0;           // 阅读位置每变一次就 ++，旧任务看到 gen 变了就自己退出
+  let preloadBusy = false;
+
+  function schedulePreload(){
+    const gen = ++preloadGen;
+    if(!currentBook || !currentBook.imported) return;
+    setTimeout(()=>{ if(gen === preloadGen) runPreload(gen); }, PRELOAD_DELAY);
+  }
+
+  async function runPreload(gen){
+    if(preloadBusy) return;
+    const book = currentBook;
+    if(!book || !book.imported || !book.chapters) return;
+    // 不在阅读页 / 舞台不可见时都不做：量不出正确尺寸，分页会被写成「整章一页」并缓存住
+    const reading = document.getElementById("reading");
+    if(!reading || !reading.classList.contains("active")) return;
+    if(!stage.clientWidth || !stage.clientHeight) return;
+    preloadBusy = true;
+    try{
+      const total = book.chapters.length;
+      // 顺序：先往后（阅读方向），再补前一章（往回翻同样不该等）
+      const queue = [];
+      for(let k = curChapter + 1; k <= Math.min(total - 1, curChapter + PRELOAD_AHEAD); k++) queue.push(k);
+      if(curChapter - 1 >= 0) queue.push(curChapter - 1);
+      for(const k of queue){
+        if(gen !== preloadGen) return;          // 位置变了，交给新任务
+        if(ensureNavigable(k)) continue;        // 正文已在，跳过
+        await ensureChapterBody(book, k);
+        if(gen !== preloadGen) return;
+        if(!animating) paginateMissing();       // 正在翻页就让开，别和动画抢主线程
+        await new Promise(r=>setTimeout(r, 0)); // 每章让出一帧
+      }
+    }catch(e){
+      // 预载失败无所谓：真翻过去时还有一次 ensureNavigable 兜底
+    }finally{
+      preloadBusy = false;
+    }
   }
 
   async function openBookById(id){
@@ -3002,6 +3123,7 @@ self.onmessage = function(e){
     if(!book) return;
     closeMenu();
     currentBook = book;
+    preloadGen++;              // 换书：上一本还在跑的预载任务立刻作废，别再碰新书的 chapters
     const pr = getProgress(book);
     curBookName = book.name;
     document.getElementById("menuBook").textContent = book.name;
@@ -3018,6 +3140,8 @@ self.onmessage = function(e){
         await ensureToc(book);                     // 首次全文切目录（Worker）并固定保存；之后直接复用
         buildChapterSkeleton(book);                // 标题齐全、正文空骨架
         chapters = book.chapters;                  // 关键：先切到导入书，绝不停留在内置样例
+        bookPages = []; allTotal = 0;              // 换书必须清掉上一本的页缓存（下标会撞车）
+        preloadGen++;                              // 作废上一本书的预载任务
         buildToc();
         showScreen("reading");
         const ci = Math.min(pr.ch||0, chapters.length-1);
@@ -3027,7 +3151,7 @@ self.onmessage = function(e){
         if(!chapters[curChapter] || !chapters[curChapter].body || !chapters[curChapter].body.length){
           chapters[curChapter] = { title: chapters[curChapter] ? chapters[curChapter].title : book.name,
                                    body: sliceBodySync(book.text, 0, Number.MAX_SAFE_INTEGER) };
-          paginateLoadedChapters();
+          paginateMissing();
         }
         if(curPage >= (bookPages[curChapter]||[]).length) curPage = 0;
         renderCurrent();
@@ -3263,9 +3387,17 @@ self.onmessage = function(e){
   fontRangeEl.addEventListener("change", ()=>{ updateFont(); });
 
   // ---------- 亮度 ----------
+  // 滑条表示的是「亮度」：最左 0 = 最暗，最右 60 = 最亮（不遮罩）。
+  // 早先存的是「遮罩深浅」，0 在最左却对应最亮，往右拖反而越暗 —— 方向和两侧图标是反的。
+  function dimOpacity(v){ return ((BRIGHT_MAX - v) / 100).toFixed(2); }
+  function applyBright(){
+    const el = document.getElementById("bright");
+    if(el && Number(el.value) !== brightVal) el.value = brightVal;
+    document.getElementById("dimmer").style.opacity = dimOpacity(brightVal);
+  }
   document.getElementById("bright").addEventListener("input",e=>{
     brightVal = Number(e.target.value);
-    document.getElementById("dimmer").style.opacity=(brightVal/100).toFixed(2);
+    document.getElementById("dimmer").style.opacity = dimOpacity(brightVal);
     persist();
   });
 
@@ -3423,7 +3555,7 @@ self.onmessage = function(e){
   renderShelf();
   updateMine();
   applyTheme(curTheme);
-  if(brightVal>0) document.getElementById("dimmer").style.opacity = (brightVal/100).toFixed(2);
+  applyBright();              // 亮度滑条位置与遮罩一起恢复（老数据已按 v3 换算过）
   updateFont();
   initLiveStatus();           // 启动阅读页底栏的本机时间 / 电量实时刷新
 })();
