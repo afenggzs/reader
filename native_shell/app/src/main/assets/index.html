@@ -971,7 +971,9 @@
   }
   function saveProgress(){
     if(!currentBook) return;
-    const percent = Math.round(wholeBookPercent(curChapter, curPage));
+    // 与页脚同精度（一位小数）：书架显示的进度就是阅读页右下角那个数，
+    // 早先这里取整会让两边差 1%，看着像「进度对不上」
+    const percent = Math.round(wholeBookPercent(curChapter, curPage) * 10) / 10;
     const pr = { ch:curChapter, page:curPage, percent };
     currentBook.progress = pr;
     progressStore[currentBook.id] = pr;
@@ -2078,7 +2080,7 @@ self.onmessage = function(e){
     list.forEach((b,i)=>{
       const pr = getProgress(b);
       const pct = pr.percent || 0;
-      const progLabel = pct>0 ? (pct>=100 ? "已读完" : `已读 ${pct}%`) : "未读";
+      const progLabel = pct >= 99.95 ? "已读完" : (pct > 0 ? `已读 ${fmtPct(pct)}` : "未读");
       const el = document.createElement("div");
       el.className="book";
       el.style.animationDelay=(i*0.03)+"s";
@@ -2176,23 +2178,30 @@ self.onmessage = function(e){
     return n + pg + 1;
   }
 
-  // 整书进度百分比：分段解析（导入书）下全书尚未完全分页，用目录行号比例估算。
-  // 返回**保留一位小数**的值（页脚要显示 68.7% 这种精度）；需要整数的调用方自己 Math.round。
+  // 整书进度百分比。
+  // ⚠ 分片加载后**不能再用 allTotal 当分母**：它只是「已分页章节的页数和」，
+  // 读到当前分片末尾就会算成 100%（页脚和书架一起错）。导入书一律按目录行号区间
+  // 估算整书位置，与窗口里分了几章无关；只有内置书是全量分页的，继续用页数。
+  // 返回**保留一位小数**的值（页脚要显示 68.7% 这种精度）。
   function wholeBookPercent(ch, pg){
-    let pct = 0;
-    if(allTotal > 0){
-      pct = Math.round(globalNo(ch, pg)/allTotal*1000)/10;
-    } else if(currentBook && currentBook.imported && currentBook.toc && currentBook.toc.length){
-      const toc = currentBook.toc;
-      const totalLines = toc[toc.length-1].end || 1;
-      const cur = toc[ch] || toc[0];
-      const chLines = Math.max(1, cur.end - cur.start);
+    const toc = currentBook && currentBook.toc;
+    if(toc && toc.length && toc[ch]){
+      const totalLines = Math.max(1, toc[toc.length-1].end || 1);
+      const cur = toc[ch], next = toc[ch+1];
+      // 章末取「下一章起点」，章与章之间才连续；最后一章退回自己的 end
+      const segEnd = next ? next.start : (cur.end || totalLines);
+      const segLen = Math.max(1, segEnd - cur.start);
       const pages = (bookPages[ch] && bookPages[ch].length) || 1;
-      const pageRatio = pg / pages;
-      const estLine = cur.start + chLines * pageRatio;
-      pct = totalLines ? Math.round(estLine/totalLines*1000)/10 : 0;
+      const page = Math.max(0, Math.min(pages - 1, pg));
+      // 只有真正读到全书最后一页才算 100%；章内按已翻过的页数折算行号
+      if(ch >= chapters.length - 1 && page >= pages - 1) return 100;
+      const estLine = cur.start + segLen * (page / pages);
+      return Math.max(0, Math.min(100, Math.round(estLine/totalLines*1000)/10));
     }
-    return Math.max(0, Math.min(100, pct));
+    if(allTotal > 0) return Math.max(0, Math.min(100, Math.round(globalNo(ch, pg)/allTotal*1000)/10));
+    // 兜底：连页数都没有时按章比例估个大概，总比一律 0% 强
+    if(chapters.length > 1) return Math.max(0, Math.min(99.9, Math.round(ch/chapters.length*1000)/10));
+    return 0;
   }
 
   // 页脚进度显示：一位小数；读到头时显示 100%，不写 100.0%
@@ -2496,13 +2505,9 @@ self.onmessage = function(e){
       curChapter = Math.max(0, chapters.length-1);
       curPage = 0;
     }
-    if(!bookPages[curChapter] || !bookPages[curChapter].length){
-      // 该章有正文但尚未分页 → 立即分页（罕见，仅在异常时序下触发）
-      const ch = chapters[curChapter];
-      bookPages[curChapter] = (ch && ch.body && ch.body.length) ? paginate(ch.body.join("\n"), ch.title) : [""];
-      if(curPage >= bookPages[curChapter].length) curPage = 0;
-    }
-    const ps = bookPages[curChapter] || [""];
+    // pagesOf 会在「正文已载入但只有占位页」时就地补排，不必在这里另写一套判断
+    const ps = pagesOf(curChapter);
+    if(curPage >= ps.length) curPage = ps.length - 1;
     topLayer.innerHTML = renderPage(ps[curPage] || "", curPage+1, ps.length, chapters[curChapter].title, globalNo(curChapter, curPage), curPage===0, curChapter, curPage, ps.firstH);
     paintPage(topLayer);
     botLayer.innerHTML = "";
@@ -2586,9 +2591,9 @@ self.onmessage = function(e){
     if(animating) return;
     if(!bookPages || !bookPages.length) return;   // 尚未分页完成，忽略翻页
     let tCh = curChapter, tPage = curPage + dir;
-    // 防御：bookPages[tCh] 缺失时补占位，避免 .length 抛错导致翻页卡死
-    if(!bookPages[tCh]) bookPages[tCh] = [""];
-    if(tPage >= bookPages[tCh].length){
+    // 防御：本页分页缺失时补占位（pagesOf 还会顺手补掉「有正文但没排」的章）
+    const curPs = pagesOf(tCh);
+    if(tPage >= curPs.length){
       // 本章已到末页，尝试进入下一章首页
       if(tCh + 1 >= chapters.length){
         // 全书最后一页：停在原地并提示。这里绝不能循环回第一章——
@@ -2611,19 +2616,20 @@ self.onmessage = function(e){
     if(!ensureNavigable(tCh)){
       const targetCh = tCh, targetDir = dir;
       loadWindowAndPaginate(currentBook, tCh).then(()=>{
-        if(!bookPages[targetCh]) bookPages[targetCh] = [""];
-        let tp = (targetDir < 0) ? (bookPages[targetCh].length - 1) : 0;
+        // 补载后该章可能还没分页（占位页），pagesOf 会就地补排，绝不提交空白页
+        const ps = pagesOf(targetCh);
+        let tp = (targetDir < 0) ? (ps.length - 1) : 0;
         if(tp < 0) tp = 0;
         doFlipCommit(targetCh, tp);
       }).catch(()=>{
-        if(!bookPages[targetCh]) bookPages[targetCh] = [""];
-        doFlipCommit(targetCh, 0);
+        const ps = pagesOf(targetCh);
+        doFlipCommit(targetCh, Math.min(ps.length - 1, 0));
       });
       return;
     }
     // 上一章末页：正文已就绪，修正为目标章末页
     if(dir < 0 && tPage === 0 && curChapter !== tCh){
-      tPage = bookPages[tCh].length - 1;
+      tPage = pagesOf(tCh).length - 1;
     }
     doFlipCommit(tCh, tPage);
   }
@@ -2695,8 +2701,18 @@ self.onmessage = function(e){
   let drag = null;        // 拖动状态对象
   let justDragged = false; // 抑制拖动后误触发的 click
 
-  // 取某章的分页数组；缺失/为空时补一个空占位页，杜绝 bookPages[ch][0] 抛错把翻页链打断
+  // 取某章的分页数组。
+  // ⚠ 不能只补空占位：预载可能已经把正文切进来、但分页被翻页动画让开过
+  // （runPreload 里 `if(!animating) paginateMissing()`），此时 bookPages[ch] 还是 [""]，
+  // 翻过去就会渲染一张空白页、页码停在 0 上。这里发现「有正文但只有占位页」就地补排。
   function pagesOf(ch){
+    const c = chapters[ch];
+    const ps = bookPages[ch];
+    const hasBody = !!(c && c.body && c.body.length);
+    const placeholder = !ps || !ps.length || (ps.length === 1 && ps[0] === "");
+    if(hasBody && placeholder && stage.clientWidth && stage.clientHeight){
+      bookPages[ch] = paginate(c.body.join("\n"), c.title);
+    }
     if(!bookPages[ch] || !bookPages[ch].length) bookPages[ch] = [""];
     return bookPages[ch];
   }
@@ -2938,8 +2954,7 @@ self.onmessage = function(e){
     if(currentBook.imported && !ensureNavigable(ci)){
       try{ await loadWindowAndPaginate(currentBook, ci); }catch(e){}
     }
-    if(!bookPages[ci] || !bookPages[ci].length) bookPages[ci] = [""];
-    const ps = bookPages[ci];
+    const ps = pagesOf(ci);   // 该章若只有占位页（预载切了正文没排页），先补排再定位
     let pg = 0;
     if(info.byLine){
       const toc = currentBook.toc, cur = toc[ci], next = toc[ci+1];
@@ -3519,8 +3534,8 @@ self.onmessage = function(e){
     if(!mineEl) return;
     const total = allBooks().length;
     const importedCnt = importedBooks.length;
-    const reading = allBooks().filter(b=>(getProgress(b).percent||0)>0 && (getProgress(b).percent||0)<100).length;
-    const finished = allBooks().filter(b=>(getProgress(b).percent||0)>=100).length;
+    const reading = allBooks().filter(b=>(getProgress(b).percent||0)>0 && (getProgress(b).percent||0)<99.95).length;
+    const finished = allBooks().filter(b=>(getProgress(b).percent||0)>=99.95).length;
     mineEl.querySelector(".s-total").textContent = total;
     mineEl.querySelector(".s-imp").textContent = importedCnt;
     mineEl.querySelector(".s-reading").textContent = reading;
@@ -3539,7 +3554,7 @@ self.onmessage = function(e){
       recent.forEach(({b,p})=>{
         const row=document.createElement("div");
         row.className="mine-row";
-        row.innerHTML = `<span>${b.name}</span><span>${p.percent>=100?"已读完":("已读 "+p.percent+"%")}</span>`;
+        row.innerHTML = `<span>${b.name}</span><span>${p.percent>=99.95?"已读完":("已读 "+fmtPct(p.percent))}</span>`;
         row.addEventListener("click",()=>openBookById(b.id));
         list.appendChild(row);
       });

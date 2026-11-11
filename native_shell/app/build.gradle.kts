@@ -5,7 +5,7 @@ plugins {
 }
 
 // 版本号由 Android/tool/stamp_version.py 写进 version.properties：
-//   versionName=1.1.1-20261107204530
+//   versionName=1.1.2-20261107204530
 //   versionCode=29626725        （距 1970 的分钟数，单调递增）
 // 每次构建都刷新，保证「改完代码能覆盖安装」，也方便在「我的」页面对上号。
 val stamp: Properties = Properties().apply {
@@ -26,7 +26,7 @@ android {
         minSdk = 24
         targetSdk = 36
         versionCode = (stamp.getProperty("versionCode") ?: "1").toInt()
-        versionName = stamp.getProperty("versionName") ?: "1.1.1"
+        versionName = stamp.getProperty("versionName") ?: "1.1.2"
     }
 
     buildTypes {
