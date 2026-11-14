@@ -1830,7 +1830,9 @@ self.onmessage = function(e){
       lvl = -1;   // 未知电量
     }
     lvl = Math.max(0, Math.min(1, lvl));
-    const fillW = lvl < 0 ? 0 : Math.round(lvl * 12.6);   // 内芯可用宽度 12.6（x2.6~15.2）
+    // 内芯可用宽度 13.8：外框 x0.6 w17.8 + 描边 1.2 居中 → 内腔 x1.2~17.8；
+    // 填充左缘 2.6（内缩 1.4），右缘必须同为 16.4，满电才是左右对称的「真满格」。
+    const fillW = lvl < 0 ? 0 : Math.min(13.8, Math.round(lvl * 13.8 * 10) / 10);
     const bolt = charging
       ? '<path d="M10.6 2.6 L6.8 6.6 L9.4 6.6 L8.2 9.4 L13 4.8 L10.4 4.8 Z" fill="currentColor"/>'
       : "";
